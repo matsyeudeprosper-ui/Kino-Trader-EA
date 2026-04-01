@@ -1,0 +1,1409 @@
+//+------------------------------------------------------------------+
+//| Candle Failure Continuation EA (MQL5 - Self-Learning Streak)     |
+//| With ADX Market Regime Detection & Directional Filtering         |
+//| Enhanced with Dynamic SL and Smart Breakeven                     |
+//+------------------------------------------------------------------+
+#property copyright "Your Name"
+#property link      ""
+#property strict
+
+// --- User Visible Inputs Only ---
+input double   RiskPercent          = 2.0;          // Risk per trade (% of equity)
+enum EALanguage { English, French };
+input EALanguage SelectedLanguage = English;          // Language for labels
+
+// --- Hidden Inputs (User doesn't need to see these) ---
+input double   LotSizeFixed         = 0.0;          // Fixed lot size (0 = use risk)
+input ENUM_TIMEFRAMES TF             = PERIOD_CURRENT;
+input int      MagicNumber           = 123456;
+input int      MaxRetries            = 3;
+input double   FreezeDistancePoints  = 5.0;
+
+input bool     UseATRFilter        = true;
+input int      ATRShortPeriod      = 14;
+input int      ATROutPeriod        = 50;
+input int      ATRHistorySize      = 200;
+input double   ATRSensitivity      = 1.0;
+input double   ATRLearningAlpha    = 0.1;
+input int      MinTradesToLearn    = 10;
+input double   LearningSmoothing   = 0.3;
+
+input int      MaxConsecutiveLosses   = 5;
+input double   BaseTradeSizeMultiplier = 1.0;
+input double   MinTradeSizeMultiplier  = 0.5;
+input double   StreakScorePenalty      = 0.5;
+input double   TargetRR                = 2.0;
+
+input bool     UseADXRegimeFilter = true;
+input int      ADXPeriod          = 14;
+input double   ADXTrendThreshold  = 25.0;
+input double   ADXRangingThreshold = 20.0;
+input double   RangingSizeReduction = 0.5;
+input double   WeakTrendSizeReduction = 0.75;
+input double   RangingScorePenalty = 0.3;
+input double   WeakTrendScorePenalty = 0.1;
+
+input int      LearningHistorySize = 100;
+input double   LearningSmoothingThreshold = 0.3;
+input bool     UseVirtualWins      = true;
+input int      VirtualWinsRequired = 1;
+
+// --- Include modules ---
+#include <Trade/Trade.mqh>
+#include <ConsecutiveLossManager.mqh>
+#include <SelfLearning.mqh>
+#include <ADXRegime.mqh>
+
+// --- State Machine ---
+enum State { IDLE, TREND_DETECTED, WEAKENING, WAIT_TRIGGER };
+
+State   buyState      = IDLE;
+State   sellState     = IDLE;
+double  trendHigh     = 0;
+double  trendLow      = 0;
+ulong   openTicket    = 0;
+
+bool    waitingBuy    = false;
+bool    buyInvalidStop = false;
+bool    buyOrderFailed = false;
+double  pendingBuyEntry = 0;
+double  pendingBuySL    = 0;
+double  pendingBuyTP    = 0;
+datetime pendingBuyTime = 0;
+
+bool    waitingSell   = false;
+bool    sellInvalidStop = false;
+bool    sellOrderFailed = false;
+double  pendingSellEntry = 0;
+double  pendingSellSL    = 0;
+double  pendingSellTP    = 0;
+datetime pendingSellTime = 0;
+
+bool    breakevenApplied = false;
+double  originalTP      = 0;
+double  beLevel         = 0;
+
+datetime lastBarTime   = 0;
+bool     catchUpMode   = false;
+
+CTrade trade;
+
+// --- ATR Filter variables ---
+int      atrShortHandle = INVALID_HANDLE;
+int      atrLongHandle  = INVALID_HANDLE;
+double   atrRatioHistory[];
+int      atrHistoryIdx  = 0;
+double   atrMean        = 1.0;
+double   atrStd         = 0.5;
+bool     atrStatsReady  = false;
+bool     atrHandlesValid = false;
+
+struct TradeRecord {
+   ulong  ticket;
+   double atrRatio;
+   double rr;
+   double profit;
+   bool   isWin;
+   datetime closeTime;
+};
+TradeRecord tradeHistory[];
+int        tradeCount = 0;
+double     learnedMinATR = 0.5;
+double     learnedMaxATR = 2.0;
+bool       learningInitialized = false;
+
+double symbolMinLot = 0.01;
+double symbolMaxLot = 100.0;
+double symbolLotStep = 0.01;
+int    symbolDigits = 2;
+
+// --- Include Risk Management module (after all variables are declared) ---
+#include <RiskManagement.mqh>
+
+// --- Helper functions ---
+string GetStateText(State s, int direction) {
+   if(SelectedLanguage == English) {
+      switch(s) {
+         case IDLE: return "IDLE";
+         case TREND_DETECTED: return "TREND_DETECTED";
+         case WEAKENING: return "WEAKENING";
+         case WAIT_TRIGGER: return "WAIT_TRIGGER";
+         default: return "";
+      }
+   } else {
+      switch(s) {
+         case IDLE: return "INACTIF";
+         case TREND_DETECTED: return "TENDANCE DÉTECTÉE";
+         case WEAKENING: return "AFFAIBLISSEMENT";
+         case WAIT_TRIGGER: return "ATTENTE DÉCLENCHEUR";
+         default: return "";
+      }
+   }
+}
+
+string GetDirectionText(int direction) {
+   if(SelectedLanguage == English) {
+      return (direction == 0) ? "BUY" : "SELL";
+   } else {
+      return (direction == 0) ? "ACHAT" : "VENTE";
+   }
+}
+
+#define HIGH(i)  iHigh(_Symbol,TF,i)
+#define LOW(i)   iLow(_Symbol,TF,i)
+#define OPEN(i)  iOpen(_Symbol,TF,i)
+#define CLOSE(i) iClose(_Symbol,TF,i)
+
+bool Bull(int i) { return CLOSE(i) > OPEN(i); }
+bool Bear(int i) { return CLOSE(i) < OPEN(i); }
+
+string GetPrefix() { return "CandleFailure_" + _Symbol + "_"; }
+
+void SaveState() {
+   string p = GetPrefix();
+   GlobalVariableSet(p + "buyState", buyState);
+   GlobalVariableSet(p + "sellState", sellState);
+   GlobalVariableSet(p + "trendHigh", trendHigh);
+   GlobalVariableSet(p + "trendLow", trendLow);
+   GlobalVariableSet(p + "openTicket", (double)openTicket);
+   GlobalVariableSet(p + "waitingBuy", waitingBuy ? 1.0 : 0.0);
+   GlobalVariableSet(p + "buyInvalidStop", buyInvalidStop ? 1.0 : 0.0);
+   GlobalVariableSet(p + "buyOrderFailed", buyOrderFailed ? 1.0 : 0.0);
+   GlobalVariableSet(p + "pendingBuyEntry", pendingBuyEntry);
+   GlobalVariableSet(p + "pendingBuySL", pendingBuySL);
+   GlobalVariableSet(p + "pendingBuyTP", pendingBuyTP);
+   GlobalVariableSet(p + "pendingBuyTime", (double)pendingBuyTime);
+   GlobalVariableSet(p + "waitingSell", waitingSell ? 1.0 : 0.0);
+   GlobalVariableSet(p + "sellInvalidStop", sellInvalidStop ? 1.0 : 0.0);
+   GlobalVariableSet(p + "sellOrderFailed", sellOrderFailed ? 1.0 : 0.0);
+   GlobalVariableSet(p + "pendingSellEntry", pendingSellEntry);
+   GlobalVariableSet(p + "pendingSellSL", pendingSellSL);
+   GlobalVariableSet(p + "pendingSellTP", pendingSellTP);
+   GlobalVariableSet(p + "pendingSellTime", (double)pendingSellTime);
+   GlobalVariableSet(p + "breakevenApplied", breakevenApplied ? 1.0 : 0.0);
+   GlobalVariableSet(p + "originalTP", originalTP);
+   GlobalVariableSet(p + "beLevel", beLevel);
+   GlobalVariableSet(p + "lastBarTime", (double)lastBarTime);
+   GlobalVariableSet(p + "learnedMinATR", learnedMinATR);
+   GlobalVariableSet(p + "learnedMaxATR", learnedMaxATR);
+}
+
+bool LoadState() {
+   string p = GetPrefix();
+   if(!GlobalVariableCheck(p + "buyState")) return false;
+   buyState = (State)(int)GlobalVariableGet(p + "buyState");
+   sellState = (State)(int)GlobalVariableGet(p + "sellState");
+   trendHigh = GlobalVariableGet(p + "trendHigh");
+   trendLow = GlobalVariableGet(p + "trendLow");
+   openTicket = (ulong)GlobalVariableGet(p + "openTicket");
+   waitingBuy = (GlobalVariableGet(p + "waitingBuy") != 0);
+   buyInvalidStop = (GlobalVariableGet(p + "buyInvalidStop") != 0);
+   buyOrderFailed = (GlobalVariableGet(p + "buyOrderFailed") != 0);
+   pendingBuyEntry = GlobalVariableGet(p + "pendingBuyEntry");
+   pendingBuySL = GlobalVariableGet(p + "pendingBuySL");
+   pendingBuyTP = GlobalVariableGet(p + "pendingBuyTP");
+   pendingBuyTime = (datetime)GlobalVariableGet(p + "pendingBuyTime");
+   waitingSell = (GlobalVariableGet(p + "waitingSell") != 0);
+   sellInvalidStop = (GlobalVariableGet(p + "sellInvalidStop") != 0);
+   sellOrderFailed = (GlobalVariableGet(p + "sellOrderFailed") != 0);
+   pendingSellEntry = GlobalVariableGet(p + "pendingSellEntry");
+   pendingSellSL = GlobalVariableGet(p + "pendingSellSL");
+   pendingSellTP = GlobalVariableGet(p + "pendingSellTP");
+   pendingSellTime = (datetime)GlobalVariableGet(p + "pendingSellTime");
+   breakevenApplied = (GlobalVariableGet(p + "breakevenApplied") != 0);
+   originalTP = GlobalVariableGet(p + "originalTP");
+   beLevel = GlobalVariableGet(p + "beLevel");
+   lastBarTime = (datetime)GlobalVariableGet(p + "lastBarTime");
+   learnedMinATR = GlobalVariableGet(p + "learnedMinATR");
+   learnedMaxATR = GlobalVariableGet(p + "learnedMaxATR");
+   learningInitialized = (learnedMinATR > 0 && learnedMaxATR > 0);
+   return true;
+}
+
+string FormatPipsAndDollars(double price1, double price2, double lotSize) {
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double points = MathAbs(price1 - price2) / point;
+   double ticks = points * point / tickSize;
+   double dollars = ticks * tickValue * lotSize;
+   return StringFormat("%.1f pips (%.2f %s)", points, dollars, AccountInfoString(ACCOUNT_CURRENCY));
+}
+
+void DrawTrendLines() {
+   ObjectDelete(0, "CandleFailure_TrendHigh");
+   ObjectDelete(0, "CandleFailure_TrendLow");
+   ObjectDelete(0, "CandleFailure_TrendHighLabel");
+   ObjectDelete(0, "CandleFailure_TrendLowLabel");
+   
+   if(waitingBuy || waitingSell) return;
+   if(trendHigh <= 0 || trendLow <= 0) return;
+   if(buyState == IDLE && sellState == IDLE) return;
+   
+   bool buyActive = (buyState != IDLE);
+   bool sellActive = (sellState != IDLE);
+   datetime endTime = TimeCurrent() + PeriodSeconds(TF) * 2;
+   
+   if(buyActive) {
+      ObjectCreate(0, "CandleFailure_TrendHigh", OBJ_HLINE, 0, 0, trendHigh);
+      ObjectSetInteger(0, "CandleFailure_TrendHigh", OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0, "CandleFailure_TrendHigh", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "CandleFailure_TrendHigh", OBJPROP_WIDTH, 1);
+      
+      string highLabel = "Trend High";
+      if(buyState != IDLE) {
+         highLabel += StringFormat(" [%s: %s]", GetDirectionText(0), GetStateText(buyState, 0));
+      }
+      ObjectCreate(0, "CandleFailure_TrendHighLabel", OBJ_TEXT, 0, endTime, trendHigh);
+      ObjectSetString(0, "CandleFailure_TrendHighLabel", OBJPROP_TEXT, highLabel);
+      ObjectSetInteger(0, "CandleFailure_TrendHighLabel", OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0, "CandleFailure_TrendHighLabel", OBJPROP_FONTSIZE, 8);
+      
+      ObjectCreate(0, "CandleFailure_TrendLow", OBJ_HLINE, 0, 0, trendLow);
+      ObjectSetInteger(0, "CandleFailure_TrendLow", OBJPROP_COLOR, clrGray);
+      ObjectSetInteger(0, "CandleFailure_TrendLow", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "CandleFailure_TrendLow", OBJPROP_WIDTH, 1);
+   }
+   else if(sellActive) {
+      ObjectCreate(0, "CandleFailure_TrendLow", OBJ_HLINE, 0, 0, trendLow);
+      ObjectSetInteger(0, "CandleFailure_TrendLow", OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, "CandleFailure_TrendLow", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "CandleFailure_TrendLow", OBJPROP_WIDTH, 1);
+      
+      string lowLabel = "Trend Low";
+      if(sellState != IDLE) {
+         lowLabel += StringFormat(" [%s: %s]", GetDirectionText(1), GetStateText(sellState, 1));
+      }
+      ObjectCreate(0, "CandleFailure_TrendLowLabel", OBJ_TEXT, 0, endTime, trendLow);
+      ObjectSetString(0, "CandleFailure_TrendLowLabel", OBJPROP_TEXT, lowLabel);
+      ObjectSetInteger(0, "CandleFailure_TrendLowLabel", OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, "CandleFailure_TrendLowLabel", OBJPROP_FONTSIZE, 8);
+      
+      ObjectCreate(0, "CandleFailure_TrendHigh", OBJ_HLINE, 0, 0, trendHigh);
+      ObjectSetInteger(0, "CandleFailure_TrendHigh", OBJPROP_COLOR, clrGray);
+      ObjectSetInteger(0, "CandleFailure_TrendHigh", OBJPROP_STYLE, STYLE_DASH);
+      ObjectSetInteger(0, "CandleFailure_TrendHigh", OBJPROP_WIDTH, 1);
+   }
+}
+
+
+void DrawTradingViewStyle(double entry, double sl, double tp, int direction, datetime entryTime, bool isVirtual = false, double lotSize = 0) {
+   // Validate inputs first - if invalid, don't delete existing lines, just return
+   if(entry <= 0 || sl <= 0 || tp <= 0) return;
+   
+   static double lastEntry = 0;
+   static double lastSL = 0;
+   static double lastTP = 0;
+   static int lastDirection = -1;
+   static datetime lastEntryTime = 0;
+   static bool lastIsVirtual = false;
+   static double lastLotSize = 0;
+   
+   // Check if values changed significantly
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   bool valuesChanged = (MathAbs(entry - lastEntry) > point * 0.1 ||
+                         MathAbs(sl - lastSL) > point * 0.1 ||
+                         MathAbs(tp - lastTP) > point * 0.1 ||
+                         direction != lastDirection ||
+                         entryTime != lastEntryTime ||
+                         isVirtual != lastIsVirtual ||
+                         MathAbs(lotSize - lastLotSize) > 0.001);
+   
+   // If nothing changed, just return (lines already exist)
+   if(!valuesChanged && ObjectFind(0, "CandleFailure_Entry") >= 0) {
+      return;
+   }
+   
+   // Update static variables
+   lastEntry = entry;
+   lastSL = sl;
+   lastTP = tp;
+   lastDirection = direction;
+   lastEntryTime = entryTime;
+   lastIsVirtual = isVirtual;
+   lastLotSize = lotSize;
+   
+   // Now delete and recreate lines
+   ObjectDelete(0, "CandleFailure_Entry");
+   ObjectDelete(0, "CandleFailure_StopLoss");
+   ObjectDelete(0, "CandleFailure_TakeProfit");
+   ObjectDelete(0, "CandleFailure_Breakeven");
+   ObjectDelete(0, "CandleFailure_Trajectory");
+   ObjectDelete(0, "CandleFailure_EntryLabel");
+   ObjectDelete(0, "CandleFailure_StopLossLabel");
+   ObjectDelete(0, "CandleFailure_TakeProfitLabel");
+   ObjectDelete(0, "CandleFailure_BreakevenLabel");
+   
+   datetime now = TimeCurrent();
+   datetime endTime = now + PeriodSeconds(TF) * 2;
+   
+   // ============================================================
+   // Calculate dynamic breakeven level based on ATR/ADX
+   // ============================================================
+   double be = 0;
+   string beLabel = "Breakeven";
+   
+   // Get current market conditions
+   double atrBuffer[];
+   double adxBuffer[];
+   ArraySetAsSeries(atrBuffer, true);
+   ArraySetAsSeries(adxBuffer, true);
+   
+   int atrHandle = iATR(_Symbol, TF, 14);
+   int adxHandle = iADX(_Symbol, TF, ADXPeriod);
+   
+   if(atrHandle != INVALID_HANDLE && adxHandle != INVALID_HANDLE) {
+      CopyBuffer(atrHandle, 0, 0, 1, atrBuffer);
+      CopyBuffer(adxHandle, 0, 0, 1, adxBuffer);
+      
+      double atr = atrBuffer[0];
+      double adx = adxBuffer[0];
+      double atrPips = atr / point;
+      
+      // Calculate risk distance in pips
+      double riskPips = (direction == 0) ? 
+                        (entry - sl) / point : 
+                        (sl - entry) / point;
+      
+      // Dynamic threshold based on ADX
+      double beThresholdPips;
+      string beThresholdType;
+      double bePercentage;
+      
+      if(adx > ADXTrendThreshold * 1.5) {
+         beThresholdPips = atrPips * 1.0;
+         beThresholdType = "1.0×ATR";
+         bePercentage = (beThresholdPips / riskPips) * 100;
+      } else if(adx > ADXTrendThreshold) {
+         beThresholdPips = atrPips * 0.7;
+         beThresholdType = "0.7×ATR";
+         bePercentage = (beThresholdPips / riskPips) * 100;
+      } else if(adx < ADXRangingThreshold) {
+         beThresholdPips = atrPips * 0.4;
+         beThresholdType = "0.4×ATR";
+         bePercentage = (beThresholdPips / riskPips) * 100;
+      } else {
+         beThresholdPips = atrPips * 0.5;
+         beThresholdType = "0.5×ATR";
+         bePercentage = (beThresholdPips / riskPips) * 100;
+      }
+      
+      // Cap percentage at 100% (can't exceed TP)
+      if(bePercentage > 100) bePercentage = 100;
+      
+      // Convert pips to price level
+      if(direction == 0) {
+         be = entry + beThresholdPips * point;
+      } else {
+         be = entry - beThresholdPips * point;
+      }
+      
+      // Format label with ATR multiple and percentage
+      beLabel = StringFormat("BE (%s - %.0f%% of risk)", beThresholdType, bePercentage);
+      
+      IndicatorRelease(atrHandle);
+      IndicatorRelease(adxHandle);
+   } else {
+      // Fallback to old 45% if indicators fail
+      if(direction == 0) {
+         be = entry + (tp - entry) * 0.45;
+      } else {
+         be = entry - (entry - tp) * 0.45;
+      }
+      beLabel = "BE (45%)";
+      if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+      if(adxHandle != INVALID_HANDLE) IndicatorRelease(adxHandle);
+   }
+   
+   // Colors and styles
+   color entryColor = (direction == 0) ? clrGreen : clrRed;
+   color slColor = clrRed;
+   color tpColor = (direction == 0) ? clrGreen : clrRed;
+   color beColor = clrGray;
+   
+   ENUM_LINE_STYLE entryStyle = isVirtual ? STYLE_DASH : STYLE_SOLID;
+   ENUM_LINE_STYLE slStyle = isVirtual ? STYLE_DOT : STYLE_DASH;
+   ENUM_LINE_STYLE tpStyle = isVirtual ? STYLE_DOT : STYLE_DASH;
+   int lineWidth = 1;
+   
+   // Draw Entry Line
+   ObjectCreate(0, "CandleFailure_Entry", OBJ_HLINE, 0, 0, entry);
+   ObjectSetInteger(0, "CandleFailure_Entry", OBJPROP_COLOR, entryColor);
+   ObjectSetInteger(0, "CandleFailure_Entry", OBJPROP_STYLE, entryStyle);
+   ObjectSetInteger(0, "CandleFailure_Entry", OBJPROP_WIDTH, lineWidth);
+   
+   string entryLabel = "Entry";
+   if(!isVirtual && lotSize > 0) {
+      double rr = 0;
+      if(direction == 0) rr = (tp - entry) / (entry - sl);
+      else rr = (entry - tp) / (sl - entry);
+      if(rr > 0) entryLabel += StringFormat(" [RR: %.2f]", rr);
+   }
+   ObjectCreate(0, "CandleFailure_EntryLabel", OBJ_TEXT, 0, endTime, entry);
+   ObjectSetString(0, "CandleFailure_EntryLabel", OBJPROP_TEXT, entryLabel);
+   ObjectSetInteger(0, "CandleFailure_EntryLabel", OBJPROP_COLOR, entryColor);
+   ObjectSetInteger(0, "CandleFailure_EntryLabel", OBJPROP_FONTSIZE, 9);
+   
+   // Draw Stop Loss Line
+   bool slAtEntry = (MathAbs(sl - entry) < point * 0.1);
+   if(!slAtEntry) {
+      ObjectCreate(0, "CandleFailure_StopLoss", OBJ_HLINE, 0, 0, sl);
+      ObjectSetInteger(0, "CandleFailure_StopLoss", OBJPROP_COLOR, slColor);
+      ObjectSetInteger(0, "CandleFailure_StopLoss", OBJPROP_STYLE, slStyle);
+      ObjectSetInteger(0, "CandleFailure_StopLoss", OBJPROP_WIDTH, lineWidth);
+      
+      string slLabel = "SL";
+      if(lotSize > 0) {
+         string info = "";
+         if(direction == 0) info = FormatPipsAndDollars(entry, sl, lotSize);
+         else info = FormatPipsAndDollars(sl, entry, lotSize);
+         slLabel += " (" + info + ")";
+      }
+      int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+      if(stopsLevel > 0) {
+         slLabel += StringFormat(" [min SL: %d points]", stopsLevel);
+      }
+      ObjectCreate(0, "CandleFailure_StopLossLabel", OBJ_TEXT, 0, endTime, sl);
+      ObjectSetString(0, "CandleFailure_StopLossLabel", OBJPROP_TEXT, slLabel);
+      ObjectSetInteger(0, "CandleFailure_StopLossLabel", OBJPROP_COLOR, slColor);
+      ObjectSetInteger(0, "CandleFailure_StopLossLabel", OBJPROP_FONTSIZE, 9);
+   }
+   
+   // Draw Take Profit Line
+   ObjectCreate(0, "CandleFailure_TakeProfit", OBJ_HLINE, 0, 0, tp);
+   ObjectSetInteger(0, "CandleFailure_TakeProfit", OBJPROP_COLOR, tpColor);
+   ObjectSetInteger(0, "CandleFailure_TakeProfit", OBJPROP_STYLE, tpStyle);
+   ObjectSetInteger(0, "CandleFailure_TakeProfit", OBJPROP_WIDTH, lineWidth);
+   
+   string tpLabel = "TP";
+   if(lotSize > 0) {
+      string info = "";
+      if(direction == 0) info = FormatPipsAndDollars(tp, entry, lotSize);
+      else info = FormatPipsAndDollars(entry, tp, lotSize);
+      tpLabel += " (" + info + ")";
+   }
+   ObjectCreate(0, "CandleFailure_TakeProfitLabel", OBJ_TEXT, 0, endTime, tp);
+   ObjectSetString(0, "CandleFailure_TakeProfitLabel", OBJPROP_TEXT, tpLabel);
+   ObjectSetInteger(0, "CandleFailure_TakeProfitLabel", OBJPROP_COLOR, tpColor);
+   ObjectSetInteger(0, "CandleFailure_TakeProfitLabel", OBJPROP_FONTSIZE, 9);
+   
+   // Draw Breakeven Line (with dynamic label)
+   if(be > 0 && MathAbs(be - entry) > point * 0.1) {
+      ObjectCreate(0, "CandleFailure_Breakeven", OBJ_HLINE, 0, 0, be);
+      ObjectSetInteger(0, "CandleFailure_Breakeven", OBJPROP_COLOR, beColor);
+      ObjectSetInteger(0, "CandleFailure_Breakeven", OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, "CandleFailure_Breakeven", OBJPROP_WIDTH, 1);
+      
+      ObjectCreate(0, "CandleFailure_BreakevenLabel", OBJ_TEXT, 0, endTime, be);
+      ObjectSetString(0, "CandleFailure_BreakevenLabel", OBJPROP_TEXT, beLabel);
+      ObjectSetInteger(0, "CandleFailure_BreakevenLabel", OBJPROP_COLOR, beColor);
+      ObjectSetInteger(0, "CandleFailure_BreakevenLabel", OBJPROP_FONTSIZE, 9);
+   }
+   
+   // Draw Trajectory Line
+   double currentPrice;
+   if(direction == 0) currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   else currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   ObjectCreate(0, "CandleFailure_Trajectory", OBJ_TREND, 0, entryTime, entry, now, currentPrice);
+   ObjectSetInteger(0, "CandleFailure_Trajectory", OBJPROP_COLOR, entryColor);
+   ObjectSetInteger(0, "CandleFailure_Trajectory", OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, "CandleFailure_Trajectory", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, "CandleFailure_Trajectory", OBJPROP_BACK, false);
+}
+
+void DrawEntryLines() {
+   static ulong lastTicket = 0;
+   static double lastSL = 0;
+   static double lastTP = 0;
+   static bool lastWaitingBuy = false;
+   static bool lastWaitingSell = false;
+   static double lastPendingBuyEntry = 0;
+   static double lastPendingSellEntry = 0;
+   
+   ulong currentTicket = openTicket;
+   bool currentWaitingBuy = waitingBuy;
+   bool currentWaitingSell = waitingSell;
+   double currentPendingBuyEntry = pendingBuyEntry;
+   double currentPendingSellEntry = pendingSellEntry;
+   
+   // For open positions, check if SL/TP changed
+   double currentSL = 0;
+   double currentTP = 0;
+   int currentDirection = -1;
+   double currentEntry = 0;
+   datetime currentEntryTime = 0;
+   double currentLotSize = 0;
+   
+   if(HasOpenPosition() && openTicket > 0) {
+      if(PositionSelectByTicket(openTicket)) {
+         currentEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+         currentSL = PositionGetDouble(POSITION_SL);
+         currentTP = PositionGetDouble(POSITION_TP);
+         currentDirection = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 0 : 1;
+         currentEntryTime = (datetime)PositionGetInteger(POSITION_TIME);
+         currentLotSize = PositionGetDouble(POSITION_VOLUME);
+      }
+   }
+   
+   // Check if anything changed
+   bool changed = false;
+   
+   if(openTicket > 0) {
+      changed = (currentTicket != lastTicket ||
+                 MathAbs(currentSL - lastSL) > SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 0.1 ||
+                 MathAbs(currentTP - lastTP) > SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 0.1);
+   } else {
+      changed = (currentWaitingBuy != lastWaitingBuy ||
+                 currentWaitingSell != lastWaitingSell ||
+                 MathAbs(currentPendingBuyEntry - lastPendingBuyEntry) > 0.0001 ||
+                 MathAbs(currentPendingSellEntry - lastPendingSellEntry) > 0.0001);
+   }
+   
+   if(!changed && ObjectFind(0, "CandleFailure_Entry") >= 0) {
+      return;
+   }
+   
+   // Update static variables
+   lastTicket = currentTicket;
+   lastSL = currentSL;
+   lastTP = currentTP;
+   lastWaitingBuy = currentWaitingBuy;
+   lastWaitingSell = currentWaitingSell;
+   lastPendingBuyEntry = currentPendingBuyEntry;
+   lastPendingSellEntry = currentPendingSellEntry;
+   
+   // Redraw based on current state
+   if(HasOpenPosition() && openTicket > 0 && currentEntry > 0 && currentSL > 0 && currentTP > 0) {
+      DrawTradingViewStyle(currentEntry, currentSL, currentTP, currentDirection, currentEntryTime, false, currentLotSize);
+   }
+   else if(waitingBuy && pendingBuyEntry > 0 && pendingBuyTime > 0) {
+      double slPoints = (pendingBuyEntry - pendingBuySL) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double rawLot = (LotSizeFixed > 0) ? LotSizeFixed : CalculateLotSize(slPoints);
+      if(rawLot > 0) {
+         double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double finalLot = AdjustLotForMargin(rawLot, price, 0);
+         finalLot = NormalizeLotSize(finalLot);
+         if(finalLot <= 0) finalLot = 0;
+         DrawTradingViewStyle(pendingBuyEntry, pendingBuySL, pendingBuyTP, 0, pendingBuyTime, true, finalLot);
+      } else {
+         DrawTradingViewStyle(pendingBuyEntry, pendingBuySL, pendingBuyTP, 0, pendingBuyTime, true, 0);
+      }
+   }
+   else if(waitingSell && pendingSellEntry > 0 && pendingSellTime > 0) {
+      double slPoints = (pendingSellSL - pendingSellEntry) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double rawLot = (LotSizeFixed > 0) ? LotSizeFixed : CalculateLotSize(slPoints);
+      if(rawLot > 0) {
+         double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double finalLot = AdjustLotForMargin(rawLot, price, 1);
+         finalLot = NormalizeLotSize(finalLot);
+         if(finalLot <= 0) finalLot = 0;
+         DrawTradingViewStyle(pendingSellEntry, pendingSellSL, pendingSellTP, 1, pendingSellTime, true, finalLot);
+      } else {
+         DrawTradingViewStyle(pendingSellEntry, pendingSellSL, pendingSellTP, 1, pendingSellTime, true, 0);
+      }
+   }
+   else {
+      // No position and no pending - delete all lines
+      ObjectDelete(0, "CandleFailure_Entry");
+      ObjectDelete(0, "CandleFailure_StopLoss");
+      ObjectDelete(0, "CandleFailure_TakeProfit");
+      ObjectDelete(0, "CandleFailure_Breakeven");
+      ObjectDelete(0, "CandleFailure_Trajectory");
+      ObjectDelete(0, "CandleFailure_EntryLabel");
+      ObjectDelete(0, "CandleFailure_StopLossLabel");
+      ObjectDelete(0, "CandleFailure_TakeProfitLabel");
+      ObjectDelete(0, "CandleFailure_BreakevenLabel");
+   }
+}
+
+void RefreshVisuals() {
+   DrawTrendLines();
+   DrawEntryLines();
+   ADX_DrawInfo();
+}
+
+void ClearVisuals() {
+   ObjectDelete(0, "CandleFailure_TrendHigh");
+   ObjectDelete(0, "CandleFailure_TrendLow");
+   ObjectDelete(0, "CandleFailure_TrendHighLabel");
+   ObjectDelete(0, "CandleFailure_TrendLowLabel");
+   ObjectDelete(0, "CandleFailure_Entry");
+   ObjectDelete(0, "CandleFailure_StopLoss");
+   ObjectDelete(0, "CandleFailure_TakeProfit");
+   ObjectDelete(0, "CandleFailure_Breakeven");
+   ObjectDelete(0, "CandleFailure_Trajectory");
+   ObjectDelete(0, "CandleFailure_EntryLabel");
+   ObjectDelete(0, "CandleFailure_StopLossLabel");
+   ObjectDelete(0, "CandleFailure_TakeProfitLabel");
+   ObjectDelete(0, "CandleFailure_BreakevenLabel");
+   ADX_RemoveInfo();
+}
+
+bool HasOpenPosition() {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if(PositionSelectByTicket(t) &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         return true;
+   }
+   return false;
+}
+
+ulong GetOpenPositionTicket() {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if(PositionSelectByTicket(t) &&
+         PositionGetString(POSITION_SYMBOL) == _Symbol &&
+         PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         return t;
+   }
+   return 0;
+}
+
+void TryStartNewTrend(int current, int previous) {
+   if(HasOpenPosition()) return;
+   
+   if(Bull(previous) && Bull(current) && CLOSE(current) > HIGH(previous)) {
+      trendHigh = HIGH(current);
+      trendLow = LOW(current);
+      buyState = TREND_DETECTED;
+      if(sellState != IDLE) {
+         sellState = IDLE;
+         ClearWaitingSell();
+      }
+      RefreshVisuals();
+   }
+   else if(Bear(previous) && Bear(current) && CLOSE(current) < LOW(previous)) {
+      trendHigh = HIGH(current);
+      trendLow = LOW(current);
+      sellState = TREND_DETECTED;
+      if(buyState != IDLE) {
+         buyState = IDLE;
+         ClearWaitingBuy();
+      }
+      RefreshVisuals();
+   }
+}
+
+void ProcessBar(int barIndex) {
+   if(HasOpenPosition()) return;
+   
+   int current = barIndex;
+   int previous = barIndex + 1;
+   if(previous >= Bars(_Symbol,TF)) return;
+   
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double minStop = stopsLevel;
+   double freezeDist = FreezeDistancePoints * point;
+   
+   bool processAgain;
+   int loopGuard = 0;
+   do {
+      processAgain = false;
+      loopGuard++;
+      if(loopGuard > 10) break;
+      
+      // Buy logic
+      if(sellState == IDLE && !waitingBuy) {
+         switch(buyState) {
+            case IDLE:
+               if(Bull(previous) && Bull(current) && CLOSE(current) > HIGH(previous)) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  buyState = TREND_DETECTED;
+                  if(sellState != IDLE) {
+                     sellState = IDLE;
+                     ClearWaitingSell();
+                  }
+                  RefreshVisuals();
+                  processAgain = true;
+               }
+               break;
+            case TREND_DETECTED:
+               if(CLOSE(current) <= trendLow) {
+                  buyState = IDLE;
+                  ClearWaitingBuy();
+                  RefreshVisuals();
+                  TryStartNewTrend(current, previous);
+                  processAgain = true;
+                  break;
+               }
+               if(Bull(current) && HIGH(current) > trendHigh) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  RefreshVisuals();
+               }
+               if(HIGH(current) <= HIGH(previous)) {
+                  if(Bull(current) && IsATRRatioValid()) {
+                     double h = HIGH(current);
+                     double l = LOW(current);
+                     double range = h - l;
+                     double sl = l - range;
+                     double tp = h + 2 * range;
+                     double stopDistance = (h - sl) / point;
+                     
+                     double atrRatio = GetCurrentATRRatio();
+                     double rr = (tp - h) / (h - sl);
+                     double rawScore = Streak_ComputeScore(atrRatio, rr);
+                     double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 0);
+                     double dynamicThreshold = Learn_GetMinScore();
+                     double adjustedThreshold = ADX_GetCompleteThreshold(dynamicThreshold, 0);
+                     
+                     if(!Streak_ShouldExecute(adjustedScore, adjustedThreshold)) {
+                        if(UseVirtualWins) {
+                           bool simulatedWin = Learn_SimulateVirtualTrade(rawScore, atrRatio, rr);
+                           Streak_UpdateVirtualWins(simulatedWin);
+                           if(Streak_GetVirtualWins() >= VirtualWinsRequired) {
+                              Streak_ResetStreak();
+                           }
+                        }
+                        break;
+                     }
+                     
+                     bool shouldReplace = false;
+                     if(!waitingBuy) {
+                        shouldReplace = true;
+                     } else {
+                        bool betterEntry = (h < pendingBuyEntry);
+                        bool notWorseRisk = (stopDistance <= (pendingBuyEntry - pendingBuySL) / point);
+                        if(betterEntry && notWorseRisk) shouldReplace = true;
+                     }
+                     
+                     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                     bool freeze = (pendingBuyEntry > 0 && ask >= pendingBuyEntry - freezeDist);
+                     
+                     if(shouldReplace && !freeze) {
+                        pendingBuyEntry = h;
+                        pendingBuySL = sl;
+                        pendingBuyTP = tp;
+                        pendingBuyTime = iTime(_Symbol, TF, current);
+                        waitingBuy = true;
+                        buyInvalidStop = (stopDistance < minStop || stopDistance <= 0.1);
+                        if(waitingSell) ClearWaitingSell();
+                        buyState = WAIT_TRIGGER;
+                        RefreshVisuals();
+                        processAgain = true;
+                     }
+                  } else {
+                     buyState = WEAKENING;
+                     RefreshVisuals();
+                     processAgain = true;
+                  }
+               }
+               break;
+            case WEAKENING:
+               if(CLOSE(current) <= trendLow) {
+                  buyState = IDLE;
+                  ClearWaitingBuy();
+                  RefreshVisuals();
+                  TryStartNewTrend(current, previous);
+                  processAgain = true;
+                  break;
+               }
+               if(Bull(current) && HIGH(current) > trendHigh) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  buyState = TREND_DETECTED;
+                  RefreshVisuals();
+                  processAgain = true;
+               }
+               else if(Bull(current) && IsATRRatioValid()) {
+                  double h = HIGH(current);
+                  double l = LOW(current);
+                  double range = h - l;
+                  double sl = l - range;
+                  double tp = h + 2 * range;
+                  double stopDistance = (h - sl) / point;
+                  
+                  double atrRatio = GetCurrentATRRatio();
+                  double rr = (tp - h) / (h - sl);
+                  double rawScore = Streak_ComputeScore(atrRatio, rr);
+                  double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 0);
+                  double dynamicThreshold = Learn_GetMinScore();
+                  double adjustedThreshold = ADX_GetCompleteThreshold(dynamicThreshold, 0);
+                  
+                  if(!Streak_ShouldExecute(adjustedScore, adjustedThreshold)) {
+                     if(UseVirtualWins) {
+                        bool simulatedWin = Learn_SimulateVirtualTrade(rawScore, atrRatio, rr);
+                        Streak_UpdateVirtualWins(simulatedWin);
+                        if(Streak_GetVirtualWins() >= VirtualWinsRequired) {
+                           Streak_ResetStreak();
+                        }
+                     }
+                     break;
+                  }
+                  
+                  bool shouldReplace = false;
+                  if(!waitingBuy) {
+                     shouldReplace = true;
+                  } else {
+                     bool betterEntry = (h < pendingBuyEntry);
+                     bool notWorseRisk = (stopDistance <= (pendingBuyEntry - pendingBuySL) / point);
+                     if(betterEntry && notWorseRisk) shouldReplace = true;
+                  }
+                  
+                  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                  bool freeze = (pendingBuyEntry > 0 && ask >= pendingBuyEntry - freezeDist);
+                  
+                  if(shouldReplace && !freeze) {
+                     pendingBuyEntry = h;
+                     pendingBuySL = sl;
+                     pendingBuyTP = tp;
+                     pendingBuyTime = iTime(_Symbol, TF, current);
+                     waitingBuy = true;
+                     buyInvalidStop = (stopDistance < minStop || stopDistance <= 0.1);
+                     if(waitingSell) ClearWaitingSell();
+                     buyState = WAIT_TRIGGER;
+                     RefreshVisuals();
+                     processAgain = true;
+                  }
+               }
+               break;
+            case WAIT_TRIGGER:
+               if(CLOSE(current) <= trendLow) {
+                  buyState = IDLE;
+                  ClearWaitingBuy();
+                  RefreshVisuals();
+                  TryStartNewTrend(current, previous);
+                  processAgain = true;
+                  break;
+               }
+               if(Bull(current) && HIGH(current) > trendHigh) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  buyState = TREND_DETECTED;
+                  RefreshVisuals();
+                  processAgain = true;
+               }
+               else if(Bull(current) && IsATRRatioValid()) {
+                  double h = HIGH(current);
+                  double l = LOW(current);
+                  if(h <= trendHigh) {
+                     double range = h - l;
+                     double sl = l - range;
+                     double tp = h + 2 * range;
+                     double stopDistance = (h - sl) / point;
+                     
+                     double atrRatio = GetCurrentATRRatio();
+                     double rr = (tp - h) / (h - sl);
+                     double rawScore = Streak_ComputeScore(atrRatio, rr);
+                     double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 0);
+                     double dynamicThreshold = Learn_GetMinScore();
+                     double adjustedThreshold = ADX_GetCompleteThreshold(dynamicThreshold, 0);
+                     
+                     if(!Streak_ShouldExecute(adjustedScore, adjustedThreshold)) {
+                        if(UseVirtualWins) {
+                           bool simulatedWin = Learn_SimulateVirtualTrade(rawScore, atrRatio, rr);
+                           Streak_UpdateVirtualWins(simulatedWin);
+                           if(Streak_GetVirtualWins() >= VirtualWinsRequired) {
+                              Streak_ResetStreak();
+                           }
+                        }
+                        break;
+                     }
+                     
+                     bool shouldReplace = false;
+                     if(!waitingBuy) {
+                        shouldReplace = true;
+                     } else {
+                        bool betterEntry = (h < pendingBuyEntry);
+                        bool notWorseRisk = (stopDistance <= (pendingBuyEntry - pendingBuySL) / point);
+                        if(betterEntry && notWorseRisk) shouldReplace = true;
+                     }
+                     
+                     double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                     bool freeze = (pendingBuyEntry > 0 && ask >= pendingBuyEntry - freezeDist);
+                     
+                     if(shouldReplace && !freeze) {
+                        pendingBuyEntry = h;
+                        pendingBuySL = sl;
+                        pendingBuyTP = tp;
+                        pendingBuyTime = iTime(_Symbol, TF, current);
+                        waitingBuy = true;
+                        buyInvalidStop = (stopDistance < minStop || stopDistance <= 0.1);
+                        if(waitingSell) ClearWaitingSell();
+                        RefreshVisuals();
+                        processAgain = true;
+                     }
+                  }
+               }
+               break;
+         }
+      }
+      
+      // Sell logic (mirroring buy)
+      if(buyState == IDLE && !waitingSell) {
+         switch(sellState) {
+            case IDLE:
+               if(Bear(previous) && Bear(current) && CLOSE(current) < LOW(previous)) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  sellState = TREND_DETECTED;
+                  if(buyState != IDLE) {
+                     buyState = IDLE;
+                     ClearWaitingBuy();
+                  }
+                  RefreshVisuals();
+                  processAgain = true;
+               }
+               break;
+            case TREND_DETECTED:
+               if(CLOSE(current) >= trendHigh) {
+                  sellState = IDLE;
+                  ClearWaitingSell();
+                  RefreshVisuals();
+                  TryStartNewTrend(current, previous);
+                  processAgain = true;
+                  break;
+               }
+               if(Bear(current) && LOW(current) < trendLow) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  RefreshVisuals();
+               }
+               if(LOW(current) >= LOW(previous)) {
+                  if(Bear(current) && IsATRRatioValid()) {
+                     double h = HIGH(current);
+                     double l = LOW(current);
+                     double range = h - l;
+                     double sl = h + range;
+                     double tp = l - 2 * range;
+                     double stopDistance = (sl - l) / point;
+                     
+                     double atrRatio = GetCurrentATRRatio();
+                     double rr = (l - tp) / (sl - l);
+                     double rawScore = Streak_ComputeScore(atrRatio, rr);
+                     double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 1);
+                     double dynamicThreshold = Learn_GetMinScore();
+                     double adjustedThreshold = ADX_GetCompleteThreshold(dynamicThreshold, 1);
+                     
+                     if(!Streak_ShouldExecute(adjustedScore, adjustedThreshold)) {
+                        if(UseVirtualWins) {
+                           bool simulatedWin = Learn_SimulateVirtualTrade(rawScore, atrRatio, rr);
+                           Streak_UpdateVirtualWins(simulatedWin);
+                           if(Streak_GetVirtualWins() >= VirtualWinsRequired) {
+                              Streak_ResetStreak();
+                           }
+                        }
+                        break;
+                     }
+                     
+                     bool shouldReplace = false;
+                     if(!waitingSell) {
+                        shouldReplace = true;
+                     } else {
+                        bool betterEntry = (l > pendingSellEntry);
+                        bool notWorseRisk = (stopDistance <= (pendingSellSL - pendingSellEntry) / point);
+                        if(betterEntry && notWorseRisk) shouldReplace = true;
+                     }
+                     
+                     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                     bool freeze = (pendingSellEntry > 0 && bid <= pendingSellEntry + freezeDist);
+                     
+                     if(shouldReplace && !freeze) {
+                        pendingSellEntry = l;
+                        pendingSellSL = sl;
+                        pendingSellTP = tp;
+                        pendingSellTime = iTime(_Symbol, TF, current);
+                        waitingSell = true;
+                        sellInvalidStop = (stopDistance < minStop || stopDistance <= 0.1);
+                        if(waitingBuy) ClearWaitingBuy();
+                        sellState = WAIT_TRIGGER;
+                        RefreshVisuals();
+                        processAgain = true;
+                     }
+                  } else {
+                     sellState = WEAKENING;
+                     RefreshVisuals();
+                     processAgain = true;
+                  }
+               }
+               break;
+            case WEAKENING:
+               if(CLOSE(current) >= trendHigh) {
+                  sellState = IDLE;
+                  ClearWaitingSell();
+                  RefreshVisuals();
+                  TryStartNewTrend(current, previous);
+                  processAgain = true;
+                  break;
+               }
+               if(Bear(current) && LOW(current) < trendLow) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  sellState = TREND_DETECTED;
+                  RefreshVisuals();
+                  processAgain = true;
+               }
+               else if(Bear(current) && IsATRRatioValid()) {
+                  double h = HIGH(current);
+                  double l = LOW(current);
+                  double range = h - l;
+                  double sl = h + range;
+                  double tp = l - 2 * range;
+                  double stopDistance = (sl - l) / point;
+                  
+                  double atrRatio = GetCurrentATRRatio();
+                  double rr = (l - tp) / (sl - l);
+                  double rawScore = Streak_ComputeScore(atrRatio, rr);
+                  double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 1);
+                  double dynamicThreshold = Learn_GetMinScore();
+                  double adjustedThreshold = ADX_GetCompleteThreshold(dynamicThreshold, 1);
+                  
+                  if(!Streak_ShouldExecute(adjustedScore, adjustedThreshold)) {
+                     if(UseVirtualWins) {
+                        bool simulatedWin = Learn_SimulateVirtualTrade(rawScore, atrRatio, rr);
+                        Streak_UpdateVirtualWins(simulatedWin);
+                        if(Streak_GetVirtualWins() >= VirtualWinsRequired) {
+                           Streak_ResetStreak();
+                        }
+                     }
+                     break;
+                  }
+                  
+                  bool shouldReplace = false;
+                  if(!waitingSell) {
+                     shouldReplace = true;
+                  } else {
+                     bool betterEntry = (l > pendingSellEntry);
+                     bool notWorseRisk = (stopDistance <= (pendingSellSL - pendingSellEntry) / point);
+                     if(betterEntry && notWorseRisk) shouldReplace = true;
+                  }
+                  
+                  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                  bool freeze = (pendingSellEntry > 0 && bid <= pendingSellEntry + freezeDist);
+                  
+                  if(shouldReplace && !freeze) {
+                     pendingSellEntry = l;
+                     pendingSellSL = sl;
+                     pendingSellTP = tp;
+                     pendingSellTime = iTime(_Symbol, TF, current);
+                     waitingSell = true;
+                     sellInvalidStop = (stopDistance < minStop || stopDistance <= 0.1);
+                     if(waitingBuy) ClearWaitingBuy();
+                     sellState = WAIT_TRIGGER;
+                     RefreshVisuals();
+                     processAgain = true;
+                  }
+               }
+               break;
+            case WAIT_TRIGGER:
+               if(CLOSE(current) >= trendHigh) {
+                  sellState = IDLE;
+                  ClearWaitingSell();
+                  RefreshVisuals();
+                  TryStartNewTrend(current, previous);
+                  processAgain = true;
+                  break;
+               }
+               if(Bear(current) && LOW(current) < trendLow) {
+                  trendHigh = HIGH(current);
+                  trendLow = LOW(current);
+                  sellState = TREND_DETECTED;
+                  RefreshVisuals();
+                  processAgain = true;
+               }
+               else if(Bear(current) && IsATRRatioValid()) {
+                  double h = HIGH(current);
+                  double l = LOW(current);
+                  if(l >= trendLow) {
+                     double range = h - l;
+                     double sl = h + range;
+                     double tp = l - 2 * range;
+                     double stopDistance = (sl - l) / point;
+                     
+                     double atrRatio = GetCurrentATRRatio();
+                     double rr = (l - tp) / (sl - l);
+                     double rawScore = Streak_ComputeScore(atrRatio, rr);
+                     double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 1);
+                     double dynamicThreshold = Learn_GetMinScore();
+                     double adjustedThreshold = ADX_GetCompleteThreshold(dynamicThreshold, 1);
+                     
+                     if(!Streak_ShouldExecute(adjustedScore, adjustedThreshold)) {
+                        if(UseVirtualWins) {
+                           bool simulatedWin = Learn_SimulateVirtualTrade(rawScore, atrRatio, rr);
+                           Streak_UpdateVirtualWins(simulatedWin);
+                           if(Streak_GetVirtualWins() >= VirtualWinsRequired) {
+                              Streak_ResetStreak();
+                           }
+                        }
+                        break;
+                     }
+                     
+                     bool shouldReplace = false;
+                     if(!waitingSell) {
+                        shouldReplace = true;
+                     } else {
+                        bool betterEntry = (l > pendingSellEntry);
+                        bool notWorseRisk = (stopDistance <= (pendingSellSL - pendingSellEntry) / point);
+                        if(betterEntry && notWorseRisk) shouldReplace = true;
+                     }
+                     
+                     double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                     bool freeze = (pendingSellEntry > 0 && bid <= pendingSellEntry + freezeDist);
+                     
+                     if(shouldReplace && !freeze) {
+                        pendingSellEntry = l;
+                        pendingSellSL = sl;
+                        pendingSellTP = tp;
+                        pendingSellTime = iTime(_Symbol, TF, current);
+                        waitingSell = true;
+                        sellInvalidStop = (stopDistance < minStop || stopDistance <= 0.1);
+                        if(waitingBuy) ClearWaitingBuy();
+                        RefreshVisuals();
+                        processAgain = true;
+                     }
+                  }
+               }
+               break;
+         }
+      }
+   } while(processAgain);
+}
+
+void ClearWaitingBuy() {
+   waitingBuy = false;
+   buyInvalidStop = false;
+   buyOrderFailed = false;
+   pendingBuyEntry = pendingBuySL = pendingBuyTP = 0;
+   pendingBuyTime = 0;
+   RefreshVisuals();
+}
+
+void ClearWaitingSell() {
+   waitingSell = false;
+   sellInvalidStop = false;
+   sellOrderFailed = false;
+   pendingSellEntry = pendingSellSL = pendingSellTP = 0;
+   pendingSellTime = 0;
+   RefreshVisuals();
+}
+
+void ClearAllWaiting() { ClearWaitingBuy(); ClearWaitingSell(); }
+
+void MonitorVirtualTrade() {
+   if(HasOpenPosition()) return;
+   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(ask <= 0 || bid <= 0) return;
+   
+   if(waitingBuy && pendingBuyEntry > 0) {
+      if(bid <= pendingBuySL) {
+         ClearWaitingBuy();
+         buyState = IDLE;
+         RefreshVisuals();
+      } else if(ask >= pendingBuyTP) {
+         ClearWaitingBuy();
+         buyState = IDLE;
+         RefreshVisuals();
+      }
+   }
+   else if(waitingSell && pendingSellEntry > 0) {
+      if(ask >= pendingSellSL) {
+         ClearWaitingSell();
+         sellState = IDLE;
+         RefreshVisuals();
+      } else if(bid <= pendingSellTP) {
+         ClearWaitingSell();
+         sellState = IDLE;
+         RefreshVisuals();
+      }
+   }
+}
+
+bool IsNewBar() {
+   datetime t = iTime(_Symbol,TF,0);
+   if(t != lastBarTime) {
+      lastBarTime = t;
+      return true;
+   }
+   return false;
+}
+
+void CatchUp() {
+   if(!LoadState()) {
+      int bars = MathMin(100, Bars(_Symbol,TF));
+      for(int i = bars; i >= 2; i--) ProcessBar(i);
+      lastBarTime = iTime(_Symbol,TF,0);
+      SaveState();
+      RefreshVisuals();
+      return;
+   }
+   datetime curBar = iTime(_Symbol,TF,0);
+   if(lastBarTime >= curBar) return;
+   datetime bar = lastBarTime;
+   while(bar < curBar) {
+      datetime next = bar + PeriodSeconds(TF);
+      int shift = iBarShift(_Symbol,TF,next);
+      if(shift < 0) break;
+      ProcessBar(shift);
+      bar = next;
+   }
+   lastBarTime = curBar;
+   SaveState();
+   RefreshVisuals();
+}
+
+int OnInit() {
+   trade.SetExpertMagicNumber(MagicNumber);
+   
+   symbolMinLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   symbolMaxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   symbolLotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   PrintFormat("Symbol: %s", _Symbol);
+   PrintFormat("  Min Lot: %.5f, Max Lot: %.5f, Lot Step: %.5f", symbolMinLot, symbolMaxLot, symbolLotStep);
+   
+   InitATRHandles();
+   Streak_Init(BaseTradeSizeMultiplier, MinTradeSizeMultiplier, StreakScorePenalty, TargetRR);
+   Learn_Init(LearningHistorySize, LearningSmoothingThreshold, UseVirtualWins, VirtualWinsRequired);
+   ADX_Init(TF, UseADXRegimeFilter, ADXPeriod, ADXTrendThreshold, ADXRangingThreshold, 
+            RangingSizeReduction, WeakTrendSizeReduction, RangingScorePenalty, WeakTrendScorePenalty);
+   
+   catchUpMode = true;
+   CatchUp();
+   catchUpMode = false;
+   
+   openTicket = GetOpenPositionTicket();
+   if(openTicket != 0) {
+      ClearAllWaiting();
+      buyState = IDLE;
+      sellState = IDLE;
+      breakevenApplied = false;
+      string p = GetPrefix();
+      if(GlobalVariableCheck(p + "originalTP")) originalTP = GlobalVariableGet(p + "originalTP");
+      if(GlobalVariableCheck(p + "beLevel")) beLevel = GlobalVariableGet(p + "beLevel");
+      SaveState();
+   }
+   
+   RefreshVisuals();
+   
+   Print("EA initialized successfully");
+   Print("  - Risk per trade: ", RiskPercent, "%");
+   Print("  - Language: ", SelectedLanguage == English ? "English" : "French");
+   Print("  - Dynamic SL & Smart Breakeven: ENABLED");
+   
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) {
+   if(atrShortHandle != INVALID_HANDLE) IndicatorRelease(atrShortHandle);
+   if(atrLongHandle != INVALID_HANDLE) IndicatorRelease(atrLongHandle);
+   ADX_Cleanup();
+   ClearVisuals();
+}
+
+void OnTick() {
+   static double lastSL = 0;
+   
+   ManageBreakeven();  // Now calls smart breakeven internally
+   
+   // Force refresh if SL changed (for visual updates)
+   if(openTicket > 0 && PositionSelectByTicket(openTicket)) {
+      double currentSL = PositionGetDouble(POSITION_SL);
+      if(MathAbs(currentSL - lastSL) > SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 0.1) {
+         lastSL = currentSL;
+         RefreshVisuals();  // Force redraw when SL changes
+      }
+   }
+   
+   if(IsNewBar()) {
+      UpdateATRStats();
+      ProcessBar(1);
+      SaveState();
+   }
+   
+   MonitorVirtualTrade();
+   RefreshVisuals();
+   
+   if(!HasOpenPosition()) {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(ask <= 0 || bid <= 0) return;
+      
+      if(waitingBuy && !buyInvalidStop && !buyOrderFailed && ask >= pendingBuyEntry) {
+         double slDistPoints = (pendingBuyEntry - pendingBuySL) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+         if(slDistPoints > 0) {
+            double atrRatio = GetCurrentATRRatio();
+            double rr = (pendingBuyTP - pendingBuyEntry) / (pendingBuyEntry - pendingBuySL);
+            double rawScore = Streak_ComputeScore(atrRatio, rr);
+            double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 0);
+            if(PlaceMarketOrder(0, pendingBuySL, pendingBuyTP, slDistPoints, adjustedScore)) {
+               openTicket = trade.ResultOrder();
+               ClearAllWaiting();
+               buyState = IDLE;
+               sellState = IDLE;
+               breakevenApplied = false;
+               SaveState();
+               RefreshVisuals();
+            } else {
+               buyOrderFailed = true;
+               SaveState();
+            }
+         }
+      }
+      else if(waitingSell && !sellInvalidStop && !sellOrderFailed && bid <= pendingSellEntry) {
+         double slDistPoints = (pendingSellSL - pendingSellEntry) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+         if(slDistPoints > 0) {
+            double atrRatio = GetCurrentATRRatio();
+            double rr = (pendingSellEntry - pendingSellTP) / (pendingSellSL - pendingSellEntry);
+            double rawScore = Streak_ComputeScore(atrRatio, rr);
+            double adjustedScore = ADX_GetCompleteScoreAdjustment(rawScore, 1);
+            if(PlaceMarketOrder(1, pendingSellSL, pendingSellTP, slDistPoints, adjustedScore)) {
+               openTicket = trade.ResultOrder();
+               ClearAllWaiting();
+               buyState = IDLE;
+               sellState = IDLE;
+               breakevenApplied = false;
+               SaveState();
+               RefreshVisuals();
+            } else {
+               sellOrderFailed = true;
+               SaveState();
+            }
+         }
+      }
+   }
+}
+
+void OnTrade() {
+   if(!HasOpenPosition()) {
+      static ulong lastTicket = openTicket;
+      if(lastTicket != 0 && openTicket == 0) {
+         HistorySelect(0, TimeCurrent());
+         int total = HistoryDealsTotal();
+         for(int i = total-1; i >= 0; i--) {
+            ulong ticket = HistoryDealGetTicket(i);
+            if(ticket == lastTicket) {
+               double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+               bool isWin = (profit > 0);
+               RecordTrade(lastTicket, profit, isWin);
+               Streak_OnTradeClose(profit);
+               break;
+            }
+         }
+      }
+      lastTicket = openTicket;
+      
+      buyState = IDLE;
+      sellState = IDLE;
+      openTicket = 0;
+      breakevenApplied = false;
+      originalTP = 0;
+      beLevel = 0;
+      ClearAllWaiting();
+      SaveState();
+      RefreshVisuals();
+   } else {
+      openTicket = GetOpenPositionTicket();
+      if(originalTP == 0) {
+         string p = GetPrefix();
+         if(GlobalVariableCheck(p + "originalTP")) originalTP = GlobalVariableGet(p + "originalTP");
+      }
+      RefreshVisuals();
+   }
+}
